@@ -3,7 +3,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from torchvision import datasets
 
-from transforms import train_transform, valid_test_transform
+from src.data.transforms import train_transform, valid_test_transform
 
 
 DATASET_ROOT = Path(

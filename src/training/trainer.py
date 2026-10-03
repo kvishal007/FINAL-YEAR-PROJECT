@@ -38,7 +38,7 @@ def compute_class_metrics(confusion):
     return metrics
 
 
-def set_train_mode(model):
+def set_train_mode(model, freeze_batchnorm=False):
     """
     model.train(), but keep fully frozen sub-modules in eval mode.
 
@@ -47,12 +47,20 @@ def set_train_mode(model):
     so its features would change from batch to batch even though its weights
     never update. EfficientNetBranch already handles this itself; this
     function applies the same rule to every frozen part of the model.
+
+    freeze_batchnorm: keep every BatchNorm layer in eval mode, so its running
+    mean/variance stay fixed while its weight and bias still train. Used for
+    small-batch fine-tuning, where per-batch statistics are too noisy.
     """
     model.train()
     for module in model.children():
         params = list(module.parameters())
         if params and not any(p.requires_grad for p in params):
             module.eval()
+    if freeze_batchnorm:
+        for module in model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.eval()
 
 
 def count_parameters(model):
@@ -62,9 +70,11 @@ def count_parameters(model):
     return trainable, frozen
 
 
-def train_step(model, images, labels, criterion, optimizer, scaler, device, use_amp):
+def train_step(model, images, labels, criterion, optimizer, scaler, device, use_amp,
+               max_grad_norm=None):
     """
-    One optimisation step. Returns a dict with:
+    One optimisation step. max_grad_norm (optional) clips the total gradient
+    norm after unscaling. Returns a dict with:
         loss          float
         correct       number of correct predictions in the batch
         grads_finite  all trainable gradients finite after unscaling
@@ -85,6 +95,9 @@ def train_step(model, images, labels, criterion, optimizer, scaler, device, use_
     scaler.unscale_(optimizer)
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     grads_finite = bool(grads) and all(torch.isfinite(g).all() for g in grads)
+    if max_grad_norm is not None and grads_finite:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], max_grad_norm)
 
     scale_before = scaler.get_scale()
     scaler.step(optimizer)   # skipped automatically if gradients are inf/NaN
@@ -100,15 +113,18 @@ def train_step(model, images, labels, criterion, optimizer, scaler, device, use_
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp,
-                    max_batches=None, log_every=None):
+                    max_batches=None, log_every=None, max_grad_norm=None,
+                    freeze_batchnorm=False):
     """
     Train for one pass over `loader`. Returns averaged statistics.
 
-    max_batches: stop early after this many batches (dry runs).
-    log_every:   print progress every N batches (long epochs).
+    max_batches:      stop early after this many batches (dry runs).
+    log_every:        print progress every N batches (long epochs).
+    max_grad_norm:    optional gradient clipping (see train_step).
+    freeze_batchnorm: keep BatchNorm running statistics fixed (see set_train_mode).
     Accuracy is measured on the fly in train mode (dropout active).
     """
-    set_train_mode(model)
+    set_train_mode(model, freeze_batchnorm=freeze_batchnorm)
     total_loss = 0.0
     total_samples = total_correct = 0
     applied = skipped = nonfinite = 0
@@ -116,7 +132,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp
     start = time.perf_counter()
 
     for batch_index, (images, labels) in enumerate(loader, start=1):
-        result = train_step(model, images, labels, criterion, optimizer, scaler, device, use_amp)
+        result = train_step(model, images, labels, criterion, optimizer, scaler, device, use_amp,
+                            max_grad_norm=max_grad_norm)
         batch = labels.size(0)
         total_loss += result["loss"] * batch
         total_correct += result["correct"]
